@@ -43,43 +43,32 @@ jobs:
           $clExe = "C:\Program Files\SynthEditCL\SynthEditCL.exe"
           if (-not (Test-Path $clExe)) { throw "SynthEditCL did not install" }
 
-          # 2. The VST3 export templates (se_vst3_64.dat etc.) only ship inside the
-          #    FULL SynthEdit download, not the CL one. We don't need to *register*
-          #    that MSIX - it just carries the files - so we pull the installer and
-          #    extract its payload with innoextract, then copy the templates next to
-          #    SynthEditCL, where it looks for them.
+          # 2. The VST3 export templates (se_vst3_64.dat etc.) only ship inside the FULL
+          #    SynthEdit download, not the CL one. We don't need to *register* that MSIX -
+          #    we just need the files inside it. So run the installer and copy the MSIX it
+          #    unpacks into TEMP (it sits there while its registration step runs), then
+          #    unzip the templates out of it next to SynthEditCL, where it looks for them.
           Write-Host "Downloading SynthEdit (for the export templates) ..."
           $seSetup = "$env:RUNNER_TEMP\SynthEdit-Setup.exe"
           curl.exe -L --fail -o $seSetup https://synthedit.com/release_1_6/SynthEdit-Setup.exe
 
-          choco install innoextract -y --no-progress | Out-Null
+          $p = Start-Process -PassThru -FilePath $seSetup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
           $msix = $null
-          try {
-            & innoextract --output-dir "$env:RUNNER_TEMP\se" "$seSetup" 2>&1 | Out-Null
-            $msix = Get-ChildItem "$env:RUNNER_TEMP\se" -Recurse -Filter "SynthEdit2_*.msix" -ErrorAction SilentlyContinue | Select-Object -First 1
-          } catch { Write-Host "innoextract failed: $($_.Exception.Message)" }
-
-          # Fallback: run the installer and grab the MSIX it unpacks to TEMP before
-          # it cleans up (the file sits there while its registration step runs/fails).
-          if (-not $msix) {
-            Write-Host "innoextract didn't yield the MSIX; capturing it from the installer temp dir ..."
-            $p = Start-Process -PassThru -FilePath $seSetup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
-            $deadline = (Get-Date).AddMinutes(4)
-            while (-not $msix -and (Get-Date) -lt $deadline) {
-              $cand = Get-ChildItem "$env:TEMP\is-*.tmp" -Recurse -Filter "SynthEdit2_*.msix" -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($cand -and $cand.Length -gt 50MB) {
-                Start-Sleep -Seconds 2
-                if ((Get-Item $cand.FullName).Length -eq $cand.Length) {
-                  Copy-Item $cand.FullName "$env:RUNNER_TEMP\se.msix" -Force
-                  $msix = Get-Item "$env:RUNNER_TEMP\se.msix"
-                }
+          $deadline = (Get-Date).AddMinutes(5)
+          while (-not $msix -and (Get-Date) -lt $deadline) {
+            $cand = Get-ChildItem "$env:TEMP\is-*.tmp" -Recurse -Filter "SynthEdit2_*.msix" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cand -and $cand.Length -gt 50MB) {
+              Start-Sleep -Seconds 2   # let the extraction finish - size must be stable
+              if ((Get-Item $cand.FullName).Length -eq $cand.Length) {
+                Copy-Item $cand.FullName "$env:RUNNER_TEMP\se.msix" -Force
+                $msix = Get-Item "$env:RUNNER_TEMP\se.msix"
               }
-              if (-not $msix) { Start-Sleep -Seconds 2 }
             }
-            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-            Get-Process SynthEdit2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            if (-not $msix) { Start-Sleep -Seconds 2 }
           }
-          if (-not $msix) { throw "Could not obtain the SynthEdit MSIX to extract templates from" }
+          if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          Get-Process SynthEdit2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if (-not $msix) { throw "Could not capture the SynthEdit MSIX from the installer" }
 
           # An MSIX is just a zip - extract the templates folder out of it.
           Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -92,6 +81,7 @@ jobs:
           New-Item -ItemType Directory -Force $clTpl | Out-Null
           Copy-Item "$tpl\*" $clTpl -Recurse -Force
           Write-Host "Templates staged next to SynthEditCL."
+          exit 0
 
       - name: Export VST3 (headless)
         timeout-minutes: 6
@@ -116,6 +106,7 @@ jobs:
           $stage = "$env:GITHUB_WORKSPACE\build"
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item $bundle $stage -Recurse -Force
+          exit 0
 
       - name: Build installer (Inno Setup)
         shell: powershell

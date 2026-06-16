@@ -48,9 +48,9 @@ The workflow installs the regular, public SynthEdit and runs it **headless** to 
 the plugin — the same `ExportAsPlugin` the editor's *File → Export* menu uses:
 
 - **macOS:** `SynthEdit … -autosavevst -quiet` exports the `.vst3` and `.component`.
-- **Windows:** SynthEdit ships as an MSIX app, so the workflow launches it *with package
-  identity* via `Invoke-CommandInDesktopPackage`; in `-autosavevst` mode it exports and
-  then closes itself.
+- **Windows:** the workflow uses the headless `SynthEditCL` (`-autosavevst3`). The VST3
+  export templates only ship in the full SynthEdit download, so it unpacks them from the
+  installer — no GUI install needed.
 
 A SynthEdit `.vst3` is **self‑contained** — the DSP modules it uses are embedded in the
 bundle — so the installers don't need anything else on the user's machine.
