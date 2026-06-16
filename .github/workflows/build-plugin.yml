@@ -28,22 +28,49 @@ jobs:
           Write-Host "Building version $v"
 
       - name: Install SynthEdit
+        timeout-minutes: 14
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $setup = "$env:RUNNER_TEMP\SynthEdit-Setup.exe"
+          $log   = "$env:RUNNER_TEMP\se-install.log"
           Write-Host "Downloading SynthEdit-Setup.exe ..."
           curl.exe -L --fail -o $setup https://synthedit.com/release_1_6/SynthEdit-Setup.exe
-          Write-Host "Installing silently ..."
-          Start-Process -Wait -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+
+          # The Setup.exe is an Inno bootstrapper that registers the MSIX. On a headless
+          # runner it may not exit cleanly, so we DON'T block on the process - we launch it
+          # and poll for the package to appear, then move on (killing the installer if it
+          # is still lingering). /LOG captures an install log for diagnostics.
+          Write-Host "Running installer (silent) ..."
+          $p = Start-Process -PassThru -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log"
+
+          $deadline = (Get-Date).AddMinutes(10)
+          while (-not (Get-AppxPackage "SynthEditLimited.*")) {
+            if ((Get-Date) -gt $deadline) {
+              if (Test-Path $log) { Write-Host "---- install log (tail) ----"; Get-Content $log -Tail 80 }
+              throw "SynthEdit did not register within 10 minutes"
+            }
+            if ($p.HasExited -and $p.ExitCode -ne 0 -and -not (Get-AppxPackage "SynthEditLimited.*")) {
+              if (Test-Path $log) { Write-Host "---- install log (tail) ----"; Get-Content $log -Tail 80 }
+              throw "Installer exited with code $($p.ExitCode) and no package registered"
+            }
+            Start-Sleep -Seconds 5
+          }
           $pkg = Get-AppxPackage "SynthEditLimited.*" | Select-Object -First 1
-          if (-not $pkg) { throw "SynthEdit MSIX was not registered after install" }
-          Write-Host "Installed $($pkg.PackageFullName)"
+          Write-Host "Registered $($pkg.PackageFullName)"
+          if (-not $p.HasExited) {
+            Write-Host "Installer process still running after registration - stopping it."
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
+          if (Test-Path $log) { Write-Host "---- install log (tail) ----"; Get-Content $log -Tail 30 }
 
       - name: Export VST3 (headless)
+        timeout-minutes: 8
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          # In case the installer auto-launched the SynthEdit GUI, clear it first.
+          Get-Process SynthEdit2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $proj = "$env:GITHUB_WORKSPACE\poly_synth.synthedit"
           # SynthEdit writes the bundle here and ABORTS if the folder is missing.
           $vst3Dir = "C:\Program Files\Common Files\VST3"
