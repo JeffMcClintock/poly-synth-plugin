@@ -10,7 +10,8 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Windows: export a VST3 with SynthEdit, wrap it in an Inno Setup installer.
+  # Windows: export a VST3 with the headless SynthEditCL, wrap it in an Inno
+  # Setup installer.
   # ---------------------------------------------------------------------------
   windows:
     name: Windows · VST3 + installer
@@ -27,78 +28,89 @@ jobs:
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Building version $v"
 
-      - name: Install SynthEdit
-        timeout-minutes: 14
+      - name: Install SynthEditCL + export templates
+        timeout-minutes: 12
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $setup   = "$env:RUNNER_TEMP\SynthEdit-Setup.exe"
-          $innoLog = "$env:RUNNER_TEMP\se-inno.log"
-          $seLog   = "$env:LOCALAPPDATA\SynthEdit\Installer\install.log"
-          Write-Host "Downloading SynthEdit-Setup.exe ..."
-          curl.exe -L --fail -o $setup https://synthedit.com/release_1_6/SynthEdit-Setup.exe
 
-          # The Setup.exe is an Inno bootstrapper whose Install.ps1 registers the MSIX and
-          # writes a transcript to $seLog. We don't block on the process (it may not exit
-          # cleanly headless): poll for the package, bailing out early if the transcript
-          # reports failure, and always print the transcript for diagnostics.
-          Write-Host "Running installer (silent) ..."
-          $p = Start-Process -PassThru -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$innoLog"
+          # 1. The headless exporter. SynthEditCL is a plain console app (no MSIX),
+          #    so it installs cleanly and silently and exports without a GUI.
+          Write-Host "Downloading SynthEditCL ..."
+          $clSetup = "$env:RUNNER_TEMP\SynthEditCL-Installer.exe"
+          curl.exe -L --fail -o $clSetup https://synthedit.com/release_1_6/SynthEditCL-Installer.exe
+          Start-Process -Wait -FilePath $clSetup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          $clExe = "C:\Program Files\SynthEditCL\SynthEditCL.exe"
+          if (-not (Test-Path $clExe)) { throw "SynthEditCL did not install" }
 
-          $deadline = (Get-Date).AddMinutes(8)
-          $registered = $false
-          while ((Get-Date) -lt $deadline) {
-            if (Get-AppxPackage "SynthEditLimited.*") { $registered = $true; break }
-            if (Test-Path $seLog) {
-              $t = Get-Content $seLog -Raw -ErrorAction SilentlyContinue
-              if ($t -and ($t -match 'Installation failed')) { Write-Host "(installer transcript reports failure)"; break }
+          # 2. The VST3 export templates (se_vst3_64.dat etc.) only ship inside the
+          #    FULL SynthEdit download, not the CL one. We don't need to *register*
+          #    that MSIX - it just carries the files - so we pull the installer and
+          #    extract its payload with innoextract, then copy the templates next to
+          #    SynthEditCL, where it looks for them.
+          Write-Host "Downloading SynthEdit (for the export templates) ..."
+          $seSetup = "$env:RUNNER_TEMP\SynthEdit-Setup.exe"
+          curl.exe -L --fail -o $seSetup https://synthedit.com/release_1_6/SynthEdit-Setup.exe
+
+          choco install innoextract -y --no-progress | Out-Null
+          $msix = $null
+          try {
+            & innoextract --output-dir "$env:RUNNER_TEMP\se" "$seSetup" 2>&1 | Out-Null
+            $msix = Get-ChildItem "$env:RUNNER_TEMP\se" -Recurse -Filter "SynthEdit2_*.msix" -ErrorAction SilentlyContinue | Select-Object -First 1
+          } catch { Write-Host "innoextract failed: $($_.Exception.Message)" }
+
+          # Fallback: run the installer and grab the MSIX it unpacks to TEMP before
+          # it cleans up (the file sits there while its registration step runs/fails).
+          if (-not $msix) {
+            Write-Host "innoextract didn't yield the MSIX; capturing it from the installer temp dir ..."
+            $p = Start-Process -PassThru -FilePath $seSetup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+            $deadline = (Get-Date).AddMinutes(4)
+            while (-not $msix -and (Get-Date) -lt $deadline) {
+              $cand = Get-ChildItem "$env:TEMP\is-*.tmp" -Recurse -Filter "SynthEdit2_*.msix" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($cand -and $cand.Length -gt 50MB) {
+                Start-Sleep -Seconds 2
+                if ((Get-Item $cand.FullName).Length -eq $cand.Length) {
+                  Copy-Item $cand.FullName "$env:RUNNER_TEMP\se.msix" -Force
+                  $msix = Get-Item "$env:RUNNER_TEMP\se.msix"
+                }
+              }
+              if (-not $msix) { Start-Sleep -Seconds 2 }
             }
-            Start-Sleep -Seconds 5
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+            Get-Process SynthEdit2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           }
-          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          if (-not $msix) { throw "Could not obtain the SynthEdit MSIX to extract templates from" }
 
-          Write-Host "==================== SynthEdit install.log ===================="
-          if (Test-Path $seLog) { Get-Content $seLog } else { Write-Host "(no transcript at $seLog)" }
-          Write-Host "==================== Inno log (tail) ===================="
-          if (Test-Path $innoLog) { Get-Content $innoLog -Tail 20 }
-          Write-Host "==============================================================="
-
-          if (-not $registered) { throw "SynthEdit MSIX did not register - see install.log above" }
-          $pkg = Get-AppxPackage "SynthEditLimited.*" | Select-Object -First 1
-          Write-Host "Registered $($pkg.PackageFullName)"
+          # An MSIX is just a zip - extract the templates folder out of it.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $msixDir = "$env:RUNNER_TEMP\msix"
+          if (Test-Path $msixDir) { Remove-Item $msixDir -Recurse -Force }
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($msix.FullName, $msixDir)
+          $tpl = Join-Path $msixDir "Resources\templates"
+          if (-not (Test-Path "$tpl\se_vst3_64.dat")) { throw "templates not found inside the MSIX ($tpl)" }
+          $clTpl = "C:\Program Files\SynthEditCL\Resources\templates"
+          New-Item -ItemType Directory -Force $clTpl | Out-Null
+          Copy-Item "$tpl\*" $clTpl -Recurse -Force
+          Write-Host "Templates staged next to SynthEditCL."
 
       - name: Export VST3 (headless)
-        timeout-minutes: 8
+        timeout-minutes: 6
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          # In case the installer auto-launched the SynthEdit GUI, clear it first.
-          Get-Process SynthEdit2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $proj = "$env:GITHUB_WORKSPACE\poly_synth.synthedit"
           # SynthEdit writes the bundle here and ABORTS if the folder is missing.
           $vst3Dir = "C:\Program Files\Common Files\VST3"
           New-Item -ItemType Directory -Force $vst3Dir | Out-Null
+
+          # SynthEditCL is a console app: it exports headless and exits cleanly.
+          $clExe = "C:\Program Files\SynthEditCL\SynthEditCL.exe"
+          & $clExe "$proj" -rescan -autosavevst3 -quiet
+
           $bundle = Join-Path $vst3Dir "Poly Synth.vst3"
-          $marker = Join-Path $bundle "Contents\Resources\gui.se.json"
-
-          $pkg = Get-AppxPackage "SynthEditLimited.*" | Select-Object -First 1
-          $exe = Join-Path $pkg.InstallLocation "SynthEdit2.exe"
-
-          # SynthEdit on Windows is an MSIX / WinUI3 app: it MUST run with package
-          # identity, so calling the .exe directly just hangs. Invoke-CommandInDesktopPackage
-          # launches it with identity; in -autosavevst mode it exports the plugin and
-          # then closes itself. The call returns immediately, so we poll for the output.
-          Invoke-CommandInDesktopPackage -PackageFamilyName $pkg.PackageFamilyName -AppId "App" `
-            -Command $exe -Args "`"$proj`" -rescan -autosavevst -quiet"
-
-          Write-Host "Waiting for export to finish ..."
-          $deadline = (Get-Date).AddMinutes(6)
-          while (-not (Test-Path $marker)) {
-            if ((Get-Date) -gt $deadline) { throw "Export timed out - $marker never appeared" }
-            Start-Sleep -Seconds 3
-          }
-          Write-Host "Exported:"
-          Get-ChildItem $bundle | Select-Object Name
+          $win = Join-Path $bundle "Contents\x86_64-win\Poly Synth.vst3"
+          if (-not (Test-Path $win)) { throw "Export did not produce the Windows binary" }
+          Write-Host "Exported:"; Get-ChildItem $bundle | Select-Object Name
 
           # Stage the bundle into the workspace so the installer script can find it.
           $stage = "$env:GITHUB_WORKSPACE\build"
