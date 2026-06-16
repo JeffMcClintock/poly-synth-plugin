@@ -1,0 +1,5 @@
+# Keep shell scripts LF so they run on the macOS runner regardless of host OS.
+*.sh        text eol=lf
+# Treat the SynthEdit project as text but never munge its line endings in a way
+# that changes content across platforms.
+*.synthedit text eol=lf

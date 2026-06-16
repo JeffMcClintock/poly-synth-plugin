@@ -1,0 +1,8 @@
+Poly Synth - a SynthEdit example plugin
+Copyright (c) 2026 SynthEdit
+
+This plugin is provided as a free example accompanying the SynthEdit
+"Distributing plugins with GitHub Actions" tutorial. You may use it freely
+for any purpose. It is provided "as is", without warranty of any kind.
+
+Built with SynthEdit - https://synthedit.com/

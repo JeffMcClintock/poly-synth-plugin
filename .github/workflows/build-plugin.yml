@@ -1,0 +1,170 @@
+name: Build & Release Poly Synth
+
+# Push a version tag (e.g. v1.0.0) to build installers on Windows + macOS and
+# publish them to a GitHub Release. Use "Run workflow" (workflow_dispatch) to
+# do a dry build without releasing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Windows: export a VST3 with SynthEdit, wrap it in an Inno Setup installer.
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows · VST3 + installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: ver
+        shell: powershell
+        run: |
+          $ref = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -eq "tag" -and $ref.StartsWith("v")) { $v = $ref.Substring(1) } else { $v = "0.0.0" }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Building version $v"
+
+      - name: Install SynthEdit
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = "$env:RUNNER_TEMP\SynthEdit-Setup.exe"
+          Write-Host "Downloading SynthEdit-Setup.exe ..."
+          curl.exe -L --fail -o $setup https://synthedit.com/release_1_6/SynthEdit-Setup.exe
+          Write-Host "Installing silently ..."
+          Start-Process -Wait -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          $pkg = Get-AppxPackage "SynthEditLimited.*" | Select-Object -First 1
+          if (-not $pkg) { throw "SynthEdit MSIX was not registered after install" }
+          Write-Host "Installed $($pkg.PackageFullName)"
+
+      - name: Export VST3 (headless)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $proj = "$env:GITHUB_WORKSPACE\poly_synth.synthedit"
+          # SynthEdit writes the bundle here and ABORTS if the folder is missing.
+          $vst3Dir = "C:\Program Files\Common Files\VST3"
+          New-Item -ItemType Directory -Force $vst3Dir | Out-Null
+          $bundle = Join-Path $vst3Dir "Poly Synth.vst3"
+          $marker = Join-Path $bundle "Contents\Resources\gui.se.json"
+
+          $pkg = Get-AppxPackage "SynthEditLimited.*" | Select-Object -First 1
+          $exe = Join-Path $pkg.InstallLocation "SynthEdit2.exe"
+
+          # SynthEdit on Windows is an MSIX / WinUI3 app: it MUST run with package
+          # identity, so calling the .exe directly just hangs. Invoke-CommandInDesktopPackage
+          # launches it with identity; in -autosavevst mode it exports the plugin and
+          # then closes itself. The call returns immediately, so we poll for the output.
+          Invoke-CommandInDesktopPackage -PackageFamilyName $pkg.PackageFamilyName -AppId "App" `
+            -Command $exe -Args "`"$proj`" -rescan -autosavevst -quiet"
+
+          Write-Host "Waiting for export to finish ..."
+          $deadline = (Get-Date).AddMinutes(6)
+          while (-not (Test-Path $marker)) {
+            if ((Get-Date) -gt $deadline) { throw "Export timed out - $marker never appeared" }
+            Start-Sleep -Seconds 3
+          }
+          Write-Host "Exported:"
+          Get-ChildItem $bundle | Select-Object Name
+
+          # Stage the bundle into the workspace so the installer script can find it.
+          $stage = "$env:GITHUB_WORKSPACE\build"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item $bundle $stage -Recurse -Force
+
+      - name: Build installer (Inno Setup)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup not found - installing via Chocolatey ..."
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "installer\windows\poly_synth.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: installer/windows/out/*.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # macOS: export VST3 + AU with SynthEdit, wrap them in a .pkg installer.
+  # ---------------------------------------------------------------------------
+  macos:
+    name: macOS · VST3 + AU + .pkg
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: ver
+        run: |
+          REF="${{ github.ref_name }}"
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "${REF#v}" != "$REF" ]; then V="${REF#v}"; else V="0.0.0"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building version $V"
+
+      - name: Install SynthEdit from DMG
+        run: |
+          set -euo pipefail
+          curl -L --fail -o "$RUNNER_TEMP/SynthEdit.dmg" https://synthedit.com/release_1_6/SynthEdit-Installer.dmg
+          hdiutil attach "$RUNNER_TEMP/SynthEdit.dmg" -nobrowse -mountpoint /Volumes/SynthEdit
+          sudo cp -R /Volumes/SynthEdit/SynthEdit.app /Applications/
+          hdiutil detach /Volumes/SynthEdit
+          sudo xattr -dr com.apple.quarantine /Applications/SynthEdit.app || true
+
+      - name: Export VST3 + AU (headless)
+        run: |
+          set -euo pipefail
+          # SynthEdit exports into the per-user plugin folders and aborts if they are missing.
+          mkdir -p "$HOME/Library/Audio/Plug-Ins/VST3"
+          mkdir -p "$HOME/Library/Audio/Plug-Ins/Components"
+          /Applications/SynthEdit.app/Contents/MacOS/SynthEdit "$GITHUB_WORKSPACE/poly_synth.synthedit" -rescan -autosavevst -quiet
+          echo "--- VST3 ---";       ls -la "$HOME/Library/Audio/Plug-Ins/VST3"
+          echo "--- Components ---";  ls -la "$HOME/Library/Audio/Plug-Ins/Components"
+          test -d "$HOME/Library/Audio/Plug-Ins/VST3/Poly Synth.vst3"
+          test -d "$HOME/Library/Audio/Plug-Ins/Components/Poly Synth.component"
+
+      - name: Build installer (.pkg)
+        run: |
+          chmod +x installer/macos/build-pkg.sh
+          ./installer/macos/build-pkg.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: build/out/*.pkg
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Release: attach both installers to a GitHub Release (tags only).
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [windows, macos]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - run: find dist -type f
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/windows-installer/*
+            dist/macos-installer/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

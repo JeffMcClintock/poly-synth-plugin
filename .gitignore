@@ -1,0 +1,7 @@
+# CI build outputs
+build/
+installer/windows/out/
+
+# OS cruft
+.DS_Store
+Thumbs.db
